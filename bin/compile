@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+# Minimal Universal Monorepo Buildpack for Heroku - FIXED
+# Does only what's essential - preserves existing configurations
+
+set -e
+
+BUILD_DIR=$1
+CACHE_DIR=$2
+ENV_DIR=$3
+
+# Utility functions
+indent() {
+  sed -u 's/^/       /'
+}
+
+echo "====== MINIMAL MONOREPO BUILDPACK STARTING ======" | indent
+echo "BUILD_DIR: $BUILD_DIR" | indent
+echo "CACHE_DIR: $CACHE_DIR" | indent  
+echo "ENV_DIR: $ENV_DIR" | indent
+echo "===============================================" | indent
+
+# Check for environment variables
+if [ -f "$ENV_DIR/APP_BASE" ]; then
+    APP_BASE=$(cat "$ENV_DIR/APP_BASE")
+    echo "APP_BASE detected: $APP_BASE" | indent
+else
+    echo "No APP_BASE detected - buildpack will do nothing" | indent
+    exit 0
+fi
+
+if [ -f "$ENV_DIR/SHARED_BASE" ]; then
+    SHARED_BASE=$(cat "$ENV_DIR/SHARED_BASE")
+    echo "SHARED_BASE detected: $SHARED_BASE" | indent
+fi
+
+# Step 1: Copy root parent POM for dependency resolution (save outside BUILD_DIR)
+if [ -f "$BUILD_DIR/pom.xml" ]; then
+    echo "Copying root parent POM for dependency resolution..." | indent
+    cp "$BUILD_DIR/pom.xml" "/tmp/parent-pom-backup.xml"
+    echo "Root parent POM backed up to /tmp/parent-pom-backup.xml" | indent
+fi
+
+# Step 2: Copy SHARED_BASE to root first (before moving APP_BASE)  
+if [ -n "$SHARED_BASE" ]; then
+    echo "Looking for shared folder: $SHARED_BASE" | indent
+    
+    # Check for shared folder in the original monorepo structure
+    if [ -d "$BUILD_DIR/$SHARED_BASE" ]; then
+        echo "Found shared folder at $BUILD_DIR/$SHARED_BASE" | indent
+        echo "Copying shared folder $SHARED_BASE to app root..." | indent
+        mkdir -p "$BUILD_DIR/shared-temp"
+        cp -r "$BUILD_DIR/$SHARED_BASE"/* "$BUILD_DIR/shared-temp/"
+        echo "Successfully copied $SHARED_BASE contents to shared-temp" | indent
+    else
+        echo "SHARED_BASE directory not found at $BUILD_DIR/$SHARED_BASE" | indent  
+    fi
+fi
+
+# Step 3: Copy APP_BASE to root (if it exists and is not already root)
+if [ -n "$APP_BASE" ] && [ -d "$BUILD_DIR/$APP_BASE" ]; then
+    if [ "$APP_BASE" != "." ]; then
+        echo "Moving $APP_BASE to app root..." | indent
+        
+        # Create temp directory and move APP_BASE contents
+        temp_dir=$(mktemp -d)
+        cp -r "$BUILD_DIR/$APP_BASE"/* "$temp_dir/"
+        
+        # Preserve shared-temp directory if it exists
+        if [ -d "$BUILD_DIR/shared-temp" ]; then
+            echo "Preserving shared-temp directory during APP_BASE move..." | indent
+            mv "$BUILD_DIR/shared-temp" "/tmp/shared-temp-backup"
+        fi
+        
+        # Clear BUILD_DIR and move contents back
+        rm -rf "$BUILD_DIR"/*
+        cp -r "$temp_dir"/* "$BUILD_DIR/"
+        rm -rf "$temp_dir"
+        
+        # Restore shared-temp directory if it was preserved
+        if [ -d "/tmp/shared-temp-backup" ]; then
+            mv "/tmp/shared-temp-backup" "$BUILD_DIR/shared-temp"
+            echo "Restored shared-temp directory after APP_BASE move" | indent
+        fi
+        
+        echo "Successfully moved $APP_BASE to root" | indent
+    fi
+else
+    echo "APP_BASE directory not found or already at root" | indent
+fi
+
+# Step 4: Copy shared Java source files to correct package structure
+if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
+    echo "Copying shared Java source files to correct package structure..." | indent
+    
+    # DEBUG: Show what's in shared-temp
+    echo "DEBUG: Contents of shared-temp:" | indent
+    ls -la "$BUILD_DIR/shared-temp" | sed 's/^/    /' | indent
+    
+    # DEBUG: Check if src structure exists
+    if [ -d "$BUILD_DIR/shared-temp/src" ]; then
+        echo "DEBUG: Found src/ in shared-temp, exploring structure..." | indent
+        find "$BUILD_DIR/shared-temp/src" -type f -name "*.java" | head -10 | sed 's/^/    /' | indent
+    else
+        echo "DEBUG: No src/ directory found in shared-temp" | indent
+    fi
+    
+    # Create target package directories
+    mkdir -p "$BUILD_DIR/src/main/java/com/salesforce/mcg/sharedpersistence"
+    mkdir -p "$BUILD_DIR/src/main/resources" 
+    
+    # Copy shared Java source files if they exist
+    if [ -d "$BUILD_DIR/shared-temp/src/main/java" ]; then
+        echo "Copying shared Java sources..." | indent
+        cp -r "$BUILD_DIR/shared-temp/src/main/java"/* "$BUILD_DIR/src/main/java/"
+        echo "Shared Java sources copied successfully" | indent
+        
+        # DEBUG: Show what was copied
+        echo "DEBUG: Java files now in main src:" | indent
+        find "$BUILD_DIR/src/main/java" -name "*.java" | grep -i shared | head -5 | sed 's/^/    /' | indent
+    else
+        echo "DEBUG: No src/main/java found in shared-temp, trying alternative structure..." | indent
+        # Try copying any Java files directly
+        if find "$BUILD_DIR/shared-temp" -name "*.java" | head -1 | read; then
+            echo "DEBUG: Found Java files, copying with proper structure..." | indent
+            find "$BUILD_DIR/shared-temp" -name "*.java" -exec cp {} "$BUILD_DIR/src/main/java/" \; 2>/dev/null || true
+        fi
+    fi
+    
+    # Copy shared resources if they exist  
+    if [ -d "$BUILD_DIR/shared-temp/src/main/resources" ]; then
+        echo "Copying shared resources..." | indent
+        cp -r "$BUILD_DIR/shared-temp/src/main/resources"/* "$BUILD_DIR/src/main/resources/" 2>/dev/null || true
+        echo "Shared resources copied successfully" | indent
+    fi
+    
+    # Copy any other shared POM or config files to root (but not overwrite main app files)
+    if [ -f "$BUILD_DIR/shared-temp/pom.xml" ]; then
+        cp "$BUILD_DIR/shared-temp/pom.xml" "$BUILD_DIR/shared-pom.xml"
+        echo "Shared POM saved as shared-pom.xml" | indent
+        
+        # Smart dependency merging: Only add dependencies that are actually imported
+        if [ -f "$BUILD_DIR/pom.xml" ] && [ -f "$BUILD_DIR/shared-pom.xml" ]; then
+            echo "Analyzing imports in copied Java files..." | indent
+            
+            # Find all import statements in the copied shared Java files
+            shared_imports=$(find "$BUILD_DIR/src/main/java" -name "*.java" -exec grep -h "^import " {} \; 2>/dev/null | sort -u)
+            
+            if [ -n "$shared_imports" ]; then
+                echo "Found imports in shared source files, checking for dependencies..." | indent
+                
+                # Extract dependencies from shared POM and match against imports
+                needed_deps=""
+                
+                # Check for Spring Kafka (org.springframework.kafka)
+                if echo "$shared_imports" | grep -q "org\.springframework\.kafka"; then
+                    echo "       → Found Spring Kafka imports, extracting dependency..." | indent
+                    
+                    # First, extract the dependency from <dependencies> section
+                    kafka_dep=$(awk '/<dependencies>/,/<\/dependencies>/ {
+                        if (/<dependency>/) { dep_block = ""; in_dep = 1 }
+                        if (in_dep) { dep_block = dep_block $0 "\n" }
+                        if (/<\/dependency>/) { 
+                            if (dep_block ~ /spring-kafka/) print dep_block
+                            in_dep = 0
+                        }
+                    }' "$BUILD_DIR/shared-pom.xml")
+                    
+                    echo "       → Extracted dependency block:" | indent
+                    echo "$kafka_dep" | sed 's/^/         /' | indent
+                    
+                    # Check if dependency has version, if not, try to get it from dependencyManagement
+                    if [ -n "$kafka_dep" ]; then
+                        if echo "$kafka_dep" | grep -q "<version>"; then
+                            echo "       → Dependency already has version" | indent
+                            needed_deps="$needed_deps$kafka_dep"
+                        else
+                            echo "       → No version found, checking dependencyManagement..." | indent
+                            
+                            # Extract version from dependencyManagement section
+                            kafka_version=$(awk '/<dependencyManagement>/,/<\/dependencyManagement>/ {
+                                if (/<dependency>/) { dep_block = ""; in_dep = 1 }
+                                if (in_dep) { dep_block = dep_block $0 "\n" }
+                                if (/<\/dependency>/) {
+                                    if (dep_block ~ /spring-kafka/) {
+                                        # Extract version from this dependency block using gsub
+                                        if (dep_block ~ /<version>/) {
+                                            gsub(/.*<version>/, "", dep_block)
+                                            gsub(/<\/version>.*/, "", dep_block)
+                                            gsub(/[ \t\n\r]*/, "", dep_block)
+                                            print dep_block
+                                        }
+                                    }
+                                    in_dep = 0
+                                }
+                            }' "$BUILD_DIR/shared-pom.xml")
+                            
+                            if [ -n "$kafka_version" ]; then
+                                echo "       → Found version in dependencyManagement: $kafka_version" | indent
+                                # Add version to the dependency
+                                kafka_dep_with_version=$(echo "$kafka_dep" | awk -v version="$kafka_version" '
+                                    /<\/artifactId>/ { print; print "            <version>" version "</version>"; next }
+                                    { print }
+                                ')
+                                needed_deps="$needed_deps$kafka_dep_with_version"
+                            else
+                                echo "       → No version found in dependencyManagement, trying parent POM..." | indent
+                                
+                                # Try to extract version from parent POM backup
+                                if [ -f "/tmp/parent-pom-backup.xml" ]; then
+                                    parent_kafka_version=$(awk '/<dependencyManagement>/,/<\/dependencyManagement>/ {
+                                        if (/<dependency>/) { dep_block = ""; in_dep = 1 }
+                                        if (in_dep) { dep_block = dep_block $0 "\n" }
+                                        if (/<\/dependency>/) {
+                                            if (dep_block ~ /spring-kafka/) {
+                                                # Extract version using gsub
+                                                if (dep_block ~ /<version>/) {
+                                                    gsub(/.*<version>/, "", dep_block)
+                                                    gsub(/<\/version>.*/, "", dep_block)
+                                                    gsub(/[ \t\n\r]*/, "", dep_block)
+                                                    print dep_block
+                                                }
+                                            }
+                                            in_dep = 0
+                                        }
+                                    }' "/tmp/parent-pom-backup.xml")
+                                    
+                                    if [ -n "$parent_kafka_version" ]; then
+                                        echo "       → Found version in parent POM: $parent_kafka_version" | indent
+                                        kafka_dep_with_version=$(echo "$kafka_dep" | awk -v version="$parent_kafka_version" '
+                                            /<\/artifactId>/ { print; print "            <version>" version "</version>"; next }
+                                            { print }
+                                        ')
+                                        needed_deps="$needed_deps$kafka_dep_with_version"
+                                    else
+                                        echo "       → No version in parent POM, using Spring Boot BOM fallback" | indent
+                                        echo "       → Adding spring-kafka without version (Spring Boot will manage it)" | indent
+                                        needed_deps="$needed_deps$kafka_dep"
+                                    fi
+                                else
+                                    echo "       → Parent POM backup not available, using Spring Boot BOM fallback" | indent
+                                    echo "       → Adding spring-kafka without version (Spring Boot will manage it)" | indent
+                                    needed_deps="$needed_deps$kafka_dep"
+                                fi
+                            fi
+                        fi
+                        
+                        if echo "$needed_deps" | grep -q "spring-kafka"; then
+                            echo "       ✓ Successfully added spring-kafka dependency" | indent
+                        fi
+                    fi
+                fi
+                
+                # Merge the needed dependencies into main POM
+                if [ -n "$needed_deps" ]; then
+                    echo "Merging required dependencies into main POM..." | indent
+                    echo "DEBUG: Dependencies to merge:" | indent
+                    echo "$needed_deps" | sed 's/^/       /' | indent
+                    
+                    # Check current POM structure before merge
+                    echo "DEBUG: Current dependencies section in POM:" | indent
+                    grep -A 5 -B 5 "</dependencies>" "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
+                    
+                    # ULTRA SIMPLE: Insert just before the LAST </dependencies> tag (main dependencies section)
+                    awk -v deps="$needed_deps" '
+                        { lines[NR] = $0 }
+                        /<\/dependencies>/ { last_deps_line = NR }
+                        END {
+                            for (i = 1; i <= NR; i++) {
+                                if (i == last_deps_line && !merged) {
+                                    print "        <!-- Dependencies merged from shared module based on imports -->"
+                                    printf "%s", deps
+                                    merged = 1
+                                }
+                                print lines[i]
+                            }
+                        }
+                    ' "$BUILD_DIR/pom.xml" > "$BUILD_DIR/pom-with-shared-deps.xml"
+                    
+                    mv "$BUILD_DIR/pom-with-shared-deps.xml" "$BUILD_DIR/pom.xml"
+                    
+                    # Verify merge was successful
+                    echo "DEBUG: Dependencies section after merge:" | indent
+                    grep -A 10 -B 5 "spring-kafka" "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
+                    
+                    echo "Successfully merged required shared dependencies" | indent
+                else
+                    echo "No matching dependencies found to merge" | indent
+                fi
+            else
+                echo "No imports found in shared source files" | indent
+            fi
+        fi
+    fi
+    
+    # Clean up
+    rm -rf "$BUILD_DIR/shared-temp"
+    echo "Shared source integration completed" | indent
+fi
+
+# Step 5: Handle parent POM resolution  
+if [ -f "$BUILD_DIR/pom.xml" ] && grep -q "<parent>" "$BUILD_DIR/pom.xml"; then
+    echo "Found parent POM reference, copying parent POM for resolution..." | indent
+    if [ -f "/tmp/parent-pom-backup.xml" ]; then
+        # Copy parent POM to location where Maven expects it
+        mkdir -p "$BUILD_DIR/../"
+        cp "/tmp/parent-pom-backup.xml" "$BUILD_DIR/../pom.xml"
+        echo "Parent POM copied for Maven resolution from backup" | indent
+    else
+        echo "Warning: Parent POM reference found but parent POM backup not available" | indent
+    fi
+fi
+
+# Step 6: SAFE shared dependency removal (if REMOVE_SHARED_DEPENDENCY is set)
+if [ -f "$ENV_DIR/REMOVE_SHARED_DEPENDENCY" ]; then
+    REMOVE_DEP=$(cat "$ENV_DIR/REMOVE_SHARED_DEPENDENCY")
+    echo "Safely removing shared dependency: $REMOVE_DEP" | indent
+    
+    if [ -f "$BUILD_DIR/pom.xml" ]; then
+        # SAFE removal using awk to target only the specific dependency block
+        awk -v dep="$REMOVE_DEP" '
+        /<dependency>/ { 
+            dep_block = $0
+            in_dep = 1
+            dep_groupid = ""
+            next
+        }
+        in_dep && /<groupId>/ {
+            dep_block = dep_block "\n" $0
+            # Extract groupId content
+            gsub(/<\/?groupId>/, "", $0)
+            gsub(/^[ \t]+|[ \t]+$/, "", $0)  # trim whitespace
+            dep_groupid = $0
+            next
+        }
+        in_dep && /<artifactId>/ {
+            dep_block = dep_block "\n" $0
+            # Extract artifactId content  
+            gsub(/<\/?artifactId>/, "", $0)
+            gsub(/^[ \t]+|[ \t]+$/, "", $0)  # trim whitespace
+            dep_artifact = $0
+            next
+        }
+        in_dep && /<\/dependency>/ {
+            dep_block = dep_block "\n" $0
+            in_dep = 0
+            # Check if this matches the dependency to remove
+            full_dep = dep_groupid ":" dep_artifact
+            if (full_dep == dep) {
+                print "    <!-- Removed by buildpack: " dep " -->"
+            } else {
+                print dep_block
+            }
+            dep_block = ""
+            next
+        }
+        in_dep {
+            dep_block = dep_block "\n" $0
+            next
+        }
+        !in_dep { print }
+        ' "$BUILD_DIR/pom.xml" > "$BUILD_DIR/pom-fixed.xml"
+        
+        mv "$BUILD_DIR/pom-fixed.xml" "$BUILD_DIR/pom.xml"
+        echo "Shared dependency safely removed" | indent
+    fi
+fi
+
+# Step 7: Ensure system.properties exists for Java version
+if [ ! -f "$BUILD_DIR/system.properties" ]; then
+    echo "Creating system.properties with Java 21..." | indent
+    echo "java.runtime.version=21" > "$BUILD_DIR/system.properties"
+fi
+
+echo "====== MINIMAL MONOREPO BUILDPACK COMPLETED ======" | indent
