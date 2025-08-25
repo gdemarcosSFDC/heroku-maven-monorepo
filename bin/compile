@@ -155,7 +155,20 @@ if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
                 # Create temporary file to store matched dependencies
                 temp_deps=$(mktemp)
                 
-                # Extract all Maven dependencies from shared POM and check against imports
+                # First, extract existing dependencies from main POM to avoid duplicates
+                existing_deps=$(awk '/<dependencies>/,/<\/dependencies>/ {
+                    if (/<groupId>/) { 
+                        gsub(/<[^>]*>/, ""); gsub(/[ \t]/, ""); group = $0 
+                    }
+                    if (/<artifactId>/) { 
+                        gsub(/<[^>]*>/, ""); gsub(/[ \t]/, ""); artifact = $0 
+                        if (group && artifact) print group ":" artifact
+                    }
+                }' "$BUILD_DIR/pom.xml")
+                
+                echo "       → Existing dependencies in main POM: $(echo "$existing_deps" | wc -l | tr -d ' ')" | indent
+                
+                # Extract all Maven dependencies from shared POM and check against imports + duplicates
                 awk '/<dependencies>/,/<\/dependencies>/ {
                     if (/<dependency>/) { dep_block = ""; in_dep = 1 }
                     if (in_dep) { dep_block = dep_block $0 "\n" }
@@ -173,12 +186,20 @@ if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
                             artifact_id=$(echo -e "$dep_block" | grep -o '<artifactId>[^<]*</artifactId>' | sed 's/<[^>]*>//g' | tr -d ' ')
                             
                             if [ -n "$group_id" ] && [ -n "$artifact_id" ]; then
+                                # Check if already exists in main POM
+                                dep_key="$group_id:$artifact_id"
+                                if echo "$existing_deps" | grep -q "^$dep_key$"; then
+                                    echo "       → Skipping $artifact_id (already exists in main POM)" | indent
+                                    dep_block=""
+                                    continue
+                                fi
+                                
                                 # Create import pattern from groupId (e.g., org.springframework.kafka)
                                 import_pattern=$(echo "$group_id" | sed 's/\./\\./g')
                                 
                                 # Check if this pattern appears in imports
                                 if echo "$shared_imports" | grep -q "$import_pattern"; then
-                                    echo "       → Found imports matching $group_id:$artifact_id" | indent
+                                    echo "       → Found imports matching $group_id:$artifact_id (new dependency)" | indent
                                     echo -e "$dep_block" | sed 's/^[ \t]*/        /' >> "$temp_deps"
                                     echo "       ✓ Will merge $artifact_id dependency" | indent
                                 fi
