@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Minimal Universal Monorepo Buildpack for Heroku - FIXED
-# Does only what's essential - preserves existing configurations
+# Universal Maven Multi-Service Monorepo Buildpack for Heroku
+# Dynamically handles any package structure and dependency patterns
 
 set -e
 
@@ -13,7 +13,7 @@ indent() {
   sed -u 's/^/       /'
 }
 
-echo "====== MINIMAL MONOREPO BUILDPACK STARTING ======" | indent
+echo "====== UNIVERSAL MAVEN MONOREPO BUILDPACK STARTING ======" | indent
 echo "BUILD_DIR: $BUILD_DIR" | indent
 echo "CACHE_DIR: $CACHE_DIR" | indent  
 echo "ENV_DIR: $ENV_DIR" | indent
@@ -104,25 +104,26 @@ if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
         echo "DEBUG: No src/ directory found in shared-temp" | indent
     fi
     
-    # Create target package directories
-    mkdir -p "$BUILD_DIR/src/main/java/com/salesforce/mcg/sharedpersistence"
+    # Create base directories
+    mkdir -p "$BUILD_DIR/src/main/java"
     mkdir -p "$BUILD_DIR/src/main/resources" 
     
-    # Copy shared Java source files if they exist
+    # Copy shared Java source files if they exist - preserve directory structure
     if [ -d "$BUILD_DIR/shared-temp/src/main/java" ]; then
-        echo "Copying shared Java sources..." | indent
-        cp -r "$BUILD_DIR/shared-temp/src/main/java"/* "$BUILD_DIR/src/main/java/"
+        echo "Copying shared Java sources (preserving package structure)..." | indent
+        # Use cp -r to preserve the entire directory structure
+        cp -r "$BUILD_DIR/shared-temp/src/main/java"/* "$BUILD_DIR/src/main/java/" 2>/dev/null || true
         echo "Shared Java sources copied successfully" | indent
         
-        # DEBUG: Show what was copied
-        echo "DEBUG: Java files now in main src:" | indent
-        find "$BUILD_DIR/src/main/java" -name "*.java" | grep -i shared | head -5 | sed 's/^/    /' | indent
+        # DEBUG: Show what packages were copied
+        echo "DEBUG: Package structure copied from shared module:" | indent
+        find "$BUILD_DIR/src/main/java" -type d | grep -v "^$BUILD_DIR/src/main/java$" | head -5 | sed 's/^/    /' | indent
     else
-        echo "DEBUG: No src/main/java found in shared-temp, trying alternative structure..." | indent
-        # Try copying any Java files directly
-        if find "$BUILD_DIR/shared-temp" -name "*.java" | head -1 | read; then
-            echo "DEBUG: Found Java files, copying with proper structure..." | indent
-            find "$BUILD_DIR/shared-temp" -name "*.java" -exec cp {} "$BUILD_DIR/src/main/java/" \; 2>/dev/null || true
+        echo "DEBUG: No src/main/java found in shared-temp, checking for alternative structures..." | indent
+        # Check if Java files exist anywhere in shared-temp
+        if find "$BUILD_DIR/shared-temp" -name "*.java" -type f | head -1 | read; then
+            echo "WARNING: Found Java files but not in standard Maven structure" | indent
+            echo "         Manual integration may be required for non-standard layouts" | indent
         fi
     fi
     
@@ -148,107 +149,51 @@ if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
             if [ -n "$shared_imports" ]; then
                 echo "Found imports in shared source files, checking for dependencies..." | indent
                 
-                # Extract dependencies from shared POM and match against imports
-                needed_deps=""
+                # Universal dependency mapping based on import patterns
+                echo "       → Scanning for dependency patterns in imports..." | indent
                 
-                # Check for Spring Kafka (org.springframework.kafka)
-                if echo "$shared_imports" | grep -q "org\.springframework\.kafka"; then
-                    echo "       → Found Spring Kafka imports, extracting dependency..." | indent
-                    
-                    # First, extract the dependency from <dependencies> section
-                    kafka_dep=$(awk '/<dependencies>/,/<\/dependencies>/ {
-                        if (/<dependency>/) { dep_block = ""; in_dep = 1 }
-                        if (in_dep) { dep_block = dep_block $0 "\n" }
-                        if (/<\/dependency>/) { 
-                            if (dep_block ~ /spring-kafka/) print dep_block
-                            in_dep = 0
-                        }
-                    }' "$BUILD_DIR/shared-pom.xml")
-                    
-                    echo "       → Extracted dependency block:" | indent
-                    echo "$kafka_dep" | sed 's/^/         /' | indent
-                    
-                    # Check if dependency has version, if not, try to get it from dependencyManagement
-                    if [ -n "$kafka_dep" ]; then
-                        if echo "$kafka_dep" | grep -q "<version>"; then
-                            echo "       → Dependency already has version" | indent
-                            needed_deps="$needed_deps$kafka_dep"
-                        else
-                            echo "       → No version found, checking dependencyManagement..." | indent
+                # Create temporary file to store matched dependencies
+                temp_deps=$(mktemp)
+                
+                # Extract all Maven dependencies from shared POM and check against imports
+                awk '/<dependencies>/,/<\/dependencies>/ {
+                    if (/<dependency>/) { dep_block = ""; in_dep = 1 }
+                    if (in_dep) { dep_block = dep_block $0 "\n" }
+                    if (/<\/dependency>/) { 
+                        print dep_block "---SEPARATOR---"
+                        in_dep = 0
+                    }
+                }' "$BUILD_DIR/shared-pom.xml" | while IFS= read -r line; do
+                    if [ "$line" != "---SEPARATOR---" ]; then
+                        dep_block="$dep_block$line\n"
+                    else
+                        if [ -n "$dep_block" ]; then
+                            # Extract groupId and artifactId
+                            group_id=$(echo -e "$dep_block" | grep -o '<groupId>[^<]*</groupId>' | sed 's/<[^>]*>//g' | tr -d ' ')
+                            artifact_id=$(echo -e "$dep_block" | grep -o '<artifactId>[^<]*</artifactId>' | sed 's/<[^>]*>//g' | tr -d ' ')
                             
-                            # Extract version from dependencyManagement section
-                            kafka_version=$(awk '/<dependencyManagement>/,/<\/dependencyManagement>/ {
-                                if (/<dependency>/) { dep_block = ""; in_dep = 1 }
-                                if (in_dep) { dep_block = dep_block $0 "\n" }
-                                if (/<\/dependency>/) {
-                                    if (dep_block ~ /spring-kafka/) {
-                                        # Extract version from this dependency block using gsub
-                                        if (dep_block ~ /<version>/) {
-                                            gsub(/.*<version>/, "", dep_block)
-                                            gsub(/<\/version>.*/, "", dep_block)
-                                            gsub(/[ \t\n\r]*/, "", dep_block)
-                                            print dep_block
-                                        }
-                                    }
-                                    in_dep = 0
-                                }
-                            }' "$BUILD_DIR/shared-pom.xml")
-                            
-                            if [ -n "$kafka_version" ]; then
-                                echo "       → Found version in dependencyManagement: $kafka_version" | indent
-                                # Add version to the dependency
-                                kafka_dep_with_version=$(echo "$kafka_dep" | awk -v version="$kafka_version" '
-                                    /<\/artifactId>/ { print; print "            <version>" version "</version>"; next }
-                                    { print }
-                                ')
-                                needed_deps="$needed_deps$kafka_dep_with_version"
-                            else
-                                echo "       → No version found in dependencyManagement, trying parent POM..." | indent
+                            if [ -n "$group_id" ] && [ -n "$artifact_id" ]; then
+                                # Create import pattern from groupId (e.g., org.springframework.kafka)
+                                import_pattern=$(echo "$group_id" | sed 's/\./\\./g')
                                 
-                                # Try to extract version from parent POM backup
-                                if [ -f "/tmp/parent-pom-backup.xml" ]; then
-                                    parent_kafka_version=$(awk '/<dependencyManagement>/,/<\/dependencyManagement>/ {
-                                        if (/<dependency>/) { dep_block = ""; in_dep = 1 }
-                                        if (in_dep) { dep_block = dep_block $0 "\n" }
-                                        if (/<\/dependency>/) {
-                                            if (dep_block ~ /spring-kafka/) {
-                                                # Extract version using gsub
-                                                if (dep_block ~ /<version>/) {
-                                                    gsub(/.*<version>/, "", dep_block)
-                                                    gsub(/<\/version>.*/, "", dep_block)
-                                                    gsub(/[ \t\n\r]*/, "", dep_block)
-                                                    print dep_block
-                                                }
-                                            }
-                                            in_dep = 0
-                                        }
-                                    }' "/tmp/parent-pom-backup.xml")
-                                    
-                                    if [ -n "$parent_kafka_version" ]; then
-                                        echo "       → Found version in parent POM: $parent_kafka_version" | indent
-                                        kafka_dep_with_version=$(echo "$kafka_dep" | awk -v version="$parent_kafka_version" '
-                                            /<\/artifactId>/ { print; print "            <version>" version "</version>"; next }
-                                            { print }
-                                        ')
-                                        needed_deps="$needed_deps$kafka_dep_with_version"
-                                    else
-                                        echo "       → No version in parent POM, using Spring Boot BOM fallback" | indent
-                                        echo "       → Adding spring-kafka without version (Spring Boot will manage it)" | indent
-                                        needed_deps="$needed_deps$kafka_dep"
-                                    fi
-                                else
-                                    echo "       → Parent POM backup not available, using Spring Boot BOM fallback" | indent
-                                    echo "       → Adding spring-kafka without version (Spring Boot will manage it)" | indent
-                                    needed_deps="$needed_deps$kafka_dep"
+                                # Check if this pattern appears in imports
+                                if echo "$shared_imports" | grep -q "$import_pattern"; then
+                                    echo "       → Found imports matching $group_id:$artifact_id" | indent
+                                    echo -e "$dep_block" | sed 's/^[ \t]*/        /' >> "$temp_deps"
+                                    echo "       ✓ Will merge $artifact_id dependency" | indent
                                 fi
                             fi
                         fi
-                        
-                        if echo "$needed_deps" | grep -q "spring-kafka"; then
-                            echo "       ✓ Successfully added spring-kafka dependency" | indent
-                        fi
+                        dep_block=""
                     fi
+                done
+                
+                # Read collected dependencies
+                needed_deps=""
+                if [ -s "$temp_deps" ]; then
+                    needed_deps=$(cat "$temp_deps")
                 fi
+                rm -f "$temp_deps"
                 
                 # Merge the needed dependencies into main POM
                 if [ -n "$needed_deps" ]; then
@@ -279,8 +224,8 @@ if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
                     mv "$BUILD_DIR/pom-with-shared-deps.xml" "$BUILD_DIR/pom.xml"
                     
                     # Verify merge was successful
-                    echo "DEBUG: Dependencies section after merge:" | indent
-                    grep -A 10 -B 5 "spring-kafka" "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
+                    echo "DEBUG: Dependencies section after merge (last 15 lines):" | indent
+                    tail -n 15 "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
                     
                     echo "Successfully merged required shared dependencies" | indent
                 else
@@ -371,4 +316,4 @@ if [ ! -f "$BUILD_DIR/system.properties" ]; then
     echo "java.runtime.version=21" > "$BUILD_DIR/system.properties"
 fi
 
-echo "====== MINIMAL MONOREPO BUILDPACK COMPLETED ======" | indent
+echo "====== UNIVERSAL MAVEN MONOREPO BUILDPACK COMPLETED ======" | indent
