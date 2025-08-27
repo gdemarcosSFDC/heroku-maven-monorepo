@@ -260,27 +260,30 @@ if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
     
     # CRITICAL: Remove the shared module JAR dependency to prevent resolution errors
     if [ -f "$BUILD_DIR/pom.xml" ]; then
-        echo "🔧 REMOVING mcg-shared-persistence JAR dependency (now integrated as source)..." | indent
+        # Dynamically determine the artifactId to remove based on SHARED_BASE
+        shared_artifact_id="$SHARED_BASE"
+        
+        echo "🔧 REMOVING $shared_artifact_id JAR dependency (now integrated as source)..." | indent
         
         # Show current state
-        echo "DEBUG: Checking for mcg-shared-persistence in POM..." | indent
-        if grep -q "mcg-shared-persistence" "$BUILD_DIR/pom.xml"; then
-            echo "DEBUG: Found mcg-shared-persistence dependency, removing it..." | indent
-            grep -A 3 -B 3 "mcg-shared-persistence" "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
+        echo "DEBUG: Checking for $shared_artifact_id in POM..." | indent
+        if grep -q "$shared_artifact_id" "$BUILD_DIR/pom.xml"; then
+            echo "DEBUG: Found $shared_artifact_id dependency, removing it..." | indent
+            grep -A 3 -B 3 "$shared_artifact_id" "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
         else
-            echo "DEBUG: mcg-shared-persistence not found in main POM" | indent
+            echo "DEBUG: $shared_artifact_id not found in main POM" | indent
         fi
         
-        # Remove any dependency containing mcg-shared-persistence
-        awk '
+        # Remove any dependency containing the shared module artifactId
+        awk -v target_artifact="$shared_artifact_id" '
         /<dependency>/ { 
             dep_block = $0
             in_dep = 1
-            is_shared_persistence = 0
+            is_target_artifact = 0
             next
         }
-        in_dep && /<artifactId>mcg-shared-persistence<\/artifactId>/ {
-            is_shared_persistence = 1
+        in_dep && match($0, "<artifactId>" target_artifact "</artifactId>") {
+            is_target_artifact = 1
             dep_block = dep_block "\n" $0
             next
         }
@@ -288,8 +291,8 @@ if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
             dep_block = dep_block "\n" $0
             in_dep = 0
             
-            if (is_shared_persistence) {
-                print "    <!-- REMOVED BY BUILDPACK: mcg-shared-persistence dependency (integrated as source) -->"
+            if (is_target_artifact) {
+                print "    <!-- REMOVED BY BUILDPACK: " target_artifact " dependency (integrated as source) -->"
             } else {
                 print dep_block
             }
@@ -306,12 +309,12 @@ if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
         mv "$BUILD_DIR/pom-without-shared.xml" "$BUILD_DIR/pom.xml"
         
         # Verify the removal
-        if grep -q "mcg-shared-persistence" "$BUILD_DIR/pom.xml"; then
-            echo "❌ WARNING: mcg-shared-persistence still found after removal!" | indent
+        if grep -q "$shared_artifact_id" "$BUILD_DIR/pom.xml"; then
+            echo "❌ WARNING: $shared_artifact_id still found after removal!" | indent
             echo "Remaining references:" | indent
-            grep -n "mcg-shared-persistence" "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
+            grep -n "$shared_artifact_id" "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
         else
-            echo "✅ SUCCESS: mcg-shared-persistence dependency removed from POM" | indent
+            echo "✅ SUCCESS: $shared_artifact_id dependency removed from POM" | indent
         fi
         
         # Show final dependencies section for verification
