@@ -258,6 +258,67 @@ if [ -n "$SHARED_BASE" ] && [ -d "$BUILD_DIR/shared-temp" ]; then
         fi
     fi
     
+    # CRITICAL: Remove the shared module JAR dependency to prevent resolution errors
+    if [ -f "$BUILD_DIR/pom.xml" ]; then
+        echo "🔧 REMOVING mcg-shared-persistence JAR dependency (now integrated as source)..." | indent
+        
+        # Show current state
+        echo "DEBUG: Checking for mcg-shared-persistence in POM..." | indent
+        if grep -q "mcg-shared-persistence" "$BUILD_DIR/pom.xml"; then
+            echo "DEBUG: Found mcg-shared-persistence dependency, removing it..." | indent
+            grep -A 3 -B 3 "mcg-shared-persistence" "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
+        else
+            echo "DEBUG: mcg-shared-persistence not found in main POM" | indent
+        fi
+        
+        # Remove any dependency containing mcg-shared-persistence
+        awk '
+        /<dependency>/ { 
+            dep_block = $0
+            in_dep = 1
+            is_shared_persistence = 0
+            next
+        }
+        in_dep && /<artifactId>mcg-shared-persistence<\/artifactId>/ {
+            is_shared_persistence = 1
+            dep_block = dep_block "\n" $0
+            next
+        }
+        in_dep && /<\/dependency>/ {
+            dep_block = dep_block "\n" $0
+            in_dep = 0
+            
+            if (is_shared_persistence) {
+                print "    <!-- REMOVED BY BUILDPACK: mcg-shared-persistence dependency (integrated as source) -->"
+            } else {
+                print dep_block
+            }
+            dep_block = ""
+            next
+        }
+        in_dep {
+            dep_block = dep_block "\n" $0
+            next
+        }
+        !in_dep { print }
+        ' "$BUILD_DIR/pom.xml" > "$BUILD_DIR/pom-without-shared.xml"
+        
+        mv "$BUILD_DIR/pom-without-shared.xml" "$BUILD_DIR/pom.xml"
+        
+        # Verify the removal
+        if grep -q "mcg-shared-persistence" "$BUILD_DIR/pom.xml"; then
+            echo "❌ WARNING: mcg-shared-persistence still found after removal!" | indent
+            echo "Remaining references:" | indent
+            grep -n "mcg-shared-persistence" "$BUILD_DIR/pom.xml" | sed 's/^/       /' | indent
+        else
+            echo "✅ SUCCESS: mcg-shared-persistence dependency removed from POM" | indent
+        fi
+        
+        # Show final dependencies section for verification
+        echo "DEBUG: Final dependencies section (last 10 lines):" | indent
+        grep -A 20 "<dependencies>" "$BUILD_DIR/pom.xml" | tail -10 | sed 's/^/       /' | indent
+    fi
+    
     # Clean up
     rm -rf "$BUILD_DIR/shared-temp"
     echo "Shared source integration completed" | indent
